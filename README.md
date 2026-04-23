@@ -19,3 +19,5 @@ This edition:
 
 Requires: PyQt6  (apt: python3-pyqt6 ; pip: PyQt6)
 All build dependencies are installed automatically via apt on first run.
+
+Pre-Build Releases: https://github.com/CYFARE/CKO/releases
