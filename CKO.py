@@ -35,20 +35,44 @@ import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 try:
     from PyQt6.QtCore import (
-        Qt, QThread, pyqtSignal, QObject, QSize, QTimer,
+        QObject,
+        QSize,
+        Qt,
+        QThread,
+        QTimer,
+        pyqtSignal,
     )
-    from PyQt6.QtGui import QPalette, QColor, QTextCursor
+    from PyQt6.QtGui import QColor, QPalette, QTextCursor
     from PyQt6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QFormLayout, QGroupBox, QLabel, QLineEdit, QComboBox, QSpinBox,
-        QCheckBox, QPushButton, QPlainTextEdit, QFileDialog, QMessageBox,
-        QTabWidget, QStatusBar, QProgressBar, QStyleFactory, QToolButton,
-        QDialog, QDialogButtonBox,
+        QApplication,
+        QCheckBox,
+        QComboBox,
+        QDialog,
+        QDialogButtonBox,
+        QFileDialog,
+        QFormLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QPlainTextEdit,
+        QProgressBar,
+        QPushButton,
+        QSpinBox,
+        QStatusBar,
+        QStyleFactory,
+        QTabWidget,
+        QToolButton,
+        QVBoxLayout,
+        QWidget,
     )
 except ImportError:
     sys.stderr.write(
@@ -61,17 +85,51 @@ except ImportError:
 APP_NAME = "CYFARE Kernel Optimize V2.3"
 APP_VERSION = "2.3.0"
 
+
+def _available_cpus() -> int:
+    """
+    Number of CPUs this process is actually allowed to use.
+
+    `os.cpu_count()` returns the total number of logical CPUs on the machine,
+    which is wrong when the process is confined by taskset, cpuset, or a
+    container limit.  Use sched_getaffinity / process_cpu_count first so we
+    don't request -j32 when only one core is usable.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        pass
+    try:
+        return os.process_cpu_count() or 1  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+    return os.cpu_count() or 1
+
+
 KERNEL_ORG_BASE = "https://cdn.kernel.org/pub/linux/kernel"
 CACHYOS_RAW = "https://raw.githubusercontent.com/CachyOS/kernel-patches/master"
 CACHYOS_API = "https://api.github.com/repos/CachyOS/kernel-patches/contents"
-BORE_RAW    = "https://raw.githubusercontent.com/firelzrd/bore-scheduler/main"
-BORE_API    = "https://api.github.com/repos/firelzrd/bore-scheduler/contents"
+BORE_RAW = "https://raw.githubusercontent.com/firelzrd/bore-scheduler/main"
+BORE_API = "https://api.github.com/repos/firelzrd/bore-scheduler/contents"
 
 # Kernel series we'll walk as fallback when the chosen series has no
 # patches yet. Ordered newest -> oldest.
 SUPPORTED_SERIES_ORDER = [
-    "7.0", "6.19", "6.18", "6.17", "6.16", "6.15", "6.14", "6.13",
-    "6.12", "6.11", "6.10", "6.9", "6.8", "6.7", "6.6",
+    "7.0",
+    "6.19",
+    "6.18",
+    "6.17",
+    "6.16",
+    "6.15",
+    "6.14",
+    "6.13",
+    "6.12",
+    "6.11",
+    "6.10",
+    "6.9",
+    "6.8",
+    "6.7",
+    "6.6",
 ]
 
 
@@ -79,17 +137,19 @@ SUPPORTED_SERIES_ORDER = [
 # Smart system detection
 # =============================================================================
 
+
 @dataclass
 class SystemSpecs:
     """Everything we can learn about the host that influences defaults."""
+
     # CPU
     arch: str = "x86_64"
-    cpu_vendor: str = "unknown"          # intel | amd | other
+    cpu_vendor: str = "unknown"  # intel | amd | other
     cpu_model: str = ""
-    cpu_cores: int = 1                   # physical cores (best-effort)
-    cpu_threads: int = 1                 # logical CPUs
+    cpu_cores: int = 1  # physical cores (best-effort)
+    cpu_threads: int = 1  # logical CPUs
     cpu_flags: frozenset = frozenset()
-    isa_level: str = "x86-64"            # x86-64 | x86-64-v2 | v3 | v4
+    isa_level: str = "x86-64"  # x86-64 | x86-64-v2 | v3 | v4
     # Memory
     ram_gb: int = 0
     swap_gb: int = 0
@@ -109,14 +169,17 @@ class SystemSpecs:
     distro_like: str = ""
     # Toolchain availability
     has_clang: bool = False
-    has_lld:   bool = False
+    has_lld: bool = False
 
     # Convenience
     @property
     def is_gaming_class(self) -> bool:
         """Heuristic: >=6 cores AND >=16 GB RAM AND dGPU present."""
-        return (self.cpu_threads >= 12 and self.ram_gb >= 16
-                and (self.has_nvidia or self.has_amdgpu))
+        return (
+            self.cpu_threads >= 12
+            and self.ram_gb >= 16
+            and (self.has_nvidia or self.has_amdgpu)
+        )
 
 
 def _read_text(path: str) -> str:
@@ -174,9 +237,11 @@ def _detect_isa_level(flags: frozenset) -> str:
     if v4.issubset(flags):
         return "x86-64-v4"
     # v3: AVX + AVX2 + BMI1 + BMI2 + F16C + FMA + LZCNT + MOVBE + OSXSAVE
-    v3 = {"avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "lzcnt", "movbe"}
-    # cpuinfo uses 'bmi1'/'bmi2'; some older kernels print 'bmi1' as just 'bmi'
-    if v3.issubset(flags) or (v3 - {"bmi1"}).issubset(flags) and "bmi1" in flags:
+    # Intel cpuinfo reports the LZCNT/POPCNT group as 'abm'; AMD uses 'lzcnt'.
+    v3_core = {"avx", "avx2", "bmi2", "f16c", "fma", "movbe"}
+    v3_bmi1 = {"bmi1", "bmi"}  # some old kernels shorten bmi1 -> bmi
+    v3_lzcnt = {"lzcnt", "abm"}  # abm implies lzcnt + popcnt
+    if v3_core.issubset(flags) and bool(v3_bmi1 & flags) and bool(v3_lzcnt & flags):
         return "x86-64-v3"
     # v2: CMPXCHG16B + LAHF-SAHF + POPCNT + SSE3 + SSE4.1 + SSE4.2 + SSSE3
     v2 = {"cx16", "lahf_lm", "popcnt", "pni", "sse4_1", "sse4_2", "ssse3"}
@@ -211,12 +276,15 @@ def _detect_gpus() -> tuple[bool, bool, bool]:
     out = ""
     if shutil.which("lspci"):
         try:
-            out = subprocess.run(["lspci", "-nn"], capture_output=True,
-                                 text=True, timeout=5).stdout.lower()
+            out = subprocess.run(
+                ["lspci", "-nn"], capture_output=True, text=True, timeout=5
+            ).stdout.lower()
         except Exception:
             out = ""
     nv = "nvidia" in out
-    amd = ("amd" in out and ("radeon" in out or "vga" in out)) or "advanced micro devices" in out and "vga" in out
+    amd = ("amd" in out and ("radeon" in out or "vga" in out)) or (
+        "advanced micro devices" in out and "vga" in out
+    )
     intel_gpu = "intel" in out and ("graphics" in out or "vga" in out)
     return nv, amd, intel_gpu
 
@@ -224,14 +292,23 @@ def _detect_gpus() -> tuple[bool, bool, bool]:
 def _detect_root_disk() -> tuple[bool, bool]:
     """Return (is_ssd, is_nvme) for the disk backing /."""
     try:
-        mnt = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "/"],
-                             capture_output=True, text=True, timeout=3).stdout.strip()
+        mnt = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", "/"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout.strip()
         if not mnt:
             return (False, False)
         # Strip /dev/ prefix and partition suffix
         name = Path(mnt).name
-        # Walk up to parent block device
-        base = re.sub(r"(p?\d+)$", "", name)
+        # Walk up to parent block device. NVMe partitions are nvme0n1pN;
+        # the base device is nvme0n1. SATA/SAS partitions are sdaN.
+        # eMMC partitions are mmcblk0pN.
+        if name.startswith(("nvme", "mmcblk")):
+            base = re.sub(r"p\d+$", "", name)
+        else:
+            base = re.sub(r"\d+$", "", name)
         is_nvme = base.startswith("nvme")
         rot_path = f"/sys/block/{base}/queue/rotational"
         rot = _read_text(rot_path).strip()
@@ -243,11 +320,15 @@ def _detect_root_disk() -> tuple[bool, bool]:
 
 def _detect_bootloader() -> tuple[bool, bool]:
     """Return (uses_systemd_boot, uses_grub)."""
-    sd = Path("/boot/loader/loader.conf").exists() or shutil.which("bootctl") is not None
-    grub = (Path("/boot/grub/grub.cfg").exists()
-            or Path("/boot/grub2/grub.cfg").exists()
-            or shutil.which("update-grub") is not None
-            or shutil.which("grub-mkconfig") is not None)
+    sd = (
+        Path("/boot/loader/loader.conf").exists() or shutil.which("bootctl") is not None
+    )
+    grub = (
+        Path("/boot/grub/grub.cfg").exists()
+        or Path("/boot/grub2/grub.cfg").exists()
+        or shutil.which("update-grub") is not None
+        or shutil.which("grub-mkconfig") is not None
+    )
     return sd, grub
 
 
@@ -263,7 +344,7 @@ def detect_system() -> SystemSpecs:
     else:
         vendor = "other"
 
-    threads = os.cpu_count() or 1
+    threads = _available_cpus()
     # Physical cores: count unique (physical id, core id) pairs
     cores = threads
     try:
@@ -287,27 +368,29 @@ def detect_system() -> SystemSpecs:
     sd_boot, grub = _detect_bootloader()
 
     return SystemSpecs(
-        arch = os.uname().machine,
-        cpu_vendor = vendor,
-        cpu_model = model.strip(),
-        cpu_cores = cores,
-        cpu_threads = threads,
-        cpu_flags = flags,
-        isa_level = _detect_isa_level(flags) if os.uname().machine == "x86_64" else "native",
-        ram_gb = _detect_ram_gb(),
-        swap_gb = _detect_swap_gb(),
-        has_nvidia = nv,
-        has_amdgpu = amd_gpu,
-        has_intel_gpu = intel_gpu,
-        root_is_ssd = is_ssd,
-        root_is_nvme = is_nvme,
-        uses_systemd_boot = sd_boot,
-        uses_grub = grub,
-        is_debian_family = is_debian_based(),
-        distro_id = did,
-        distro_like = like,
-        has_clang = shutil.which("clang") is not None,
-        has_lld   = shutil.which("ld.lld") is not None,
+        arch=os.uname().machine,
+        cpu_vendor=vendor,
+        cpu_model=model.strip(),
+        cpu_cores=cores,
+        cpu_threads=threads,
+        cpu_flags=flags,
+        isa_level=_detect_isa_level(flags)
+        if os.uname().machine == "x86_64"
+        else "native",
+        ram_gb=_detect_ram_gb(),
+        swap_gb=_detect_swap_gb(),
+        has_nvidia=nv,
+        has_amdgpu=amd_gpu,
+        has_intel_gpu=intel_gpu,
+        root_is_ssd=is_ssd,
+        root_is_nvme=is_nvme,
+        uses_systemd_boot=sd_boot,
+        uses_grub=grub,
+        is_debian_family=is_debian_based(),
+        distro_id=did,
+        distro_like=like,
+        has_clang=shutil.which("clang") is not None,
+        has_lld=shutil.which("ld.lld") is not None,
     )
 
 
@@ -315,24 +398,26 @@ def detect_system() -> SystemSpecs:
 # Build configuration
 # =============================================================================
 
+
 @dataclass
 class BuildConfig:
     kernel_series: str = "7.0"
-    kernel_version: str = ""            # auto-detect when empty
+    kernel_version: str = ""  # auto-detect when empty
     local_version: str = "-cyfare"
-    march: str = "auto"                 # auto | generic | x86-64-v2/v3/v4 | native
-    o_level: str = "3"                  # 2 | 3
-    preempt: str = "full"               # none | voluntary | full | rt
-    hz: str = "1000"                    # 250 | 300 | 500 | 750 | 1000
-    tick: str = "idle"                  # periodic | idle | full
-    compiler: str = "auto"              # auto | gcc | clang
-    lto: str = "auto"                   # auto | thin | full | no
-    jobs: int = os.cpu_count() or 4
-    config_mode: str = "auto"           # auto | running | localmod | defconfig | file
+    march: str = "auto"  # auto | generic | x86-64-v2/v3/v4 | native
+    o_level: str = "3"  # 2 | 3
+    preempt: str = "full"  # none | voluntary | full | rt
+    hz: str = "1000"  # 250 | 300 | 500 | 750 | 1000
+    tick: str = "idle"  # periodic | idle | full
+    compiler: str = "auto"  # auto | gcc | clang
+    lto: str = "auto"  # auto | thin | full | no
+    jobs: int = _available_cpus()
+    config_mode: str = "auto"  # auto | running | localmod | defconfig | file
     config_file: str = ""
     extra_config: str = ""
     patches: bool = True
     auto_fallback_series: bool = True
+    sched_bore: bool = True
     verbose: bool = False
     download_only: bool = False
     build_only: bool = False
@@ -343,7 +428,7 @@ class BuildConfig:
     amdgpu_tweaks: bool = False
     # Logging
     log_to_file: bool = True
-    log_file_path: str = ""      # empty = auto (outdir/build-YYYYMMDD-HHMMSS.log)
+    log_file_path: str = ""  # empty = auto (outdir/build-YYYYMMDD-HHMMSS.log)
 
 
 def smart_defaults(cfg: BuildConfig, sp: SystemSpecs) -> BuildConfig:
@@ -365,7 +450,7 @@ def smart_defaults(cfg: BuildConfig, sp: SystemSpecs) -> BuildConfig:
     """
     # ISA / march
     if sp.arch == "x86_64":
-        cfg.march = sp.isa_level   # 'x86-64'|'x86-64-v2'|'x86-64-v3'|'x86-64-v4'
+        cfg.march = sp.isa_level  # 'x86-64'|'x86-64-v2'|'x86-64-v3'|'x86-64-v4'
         if cfg.march == "x86-64":
             cfg.march = "generic"
     else:
@@ -377,7 +462,7 @@ def smart_defaults(cfg: BuildConfig, sp: SystemSpecs) -> BuildConfig:
         if sp.ram_gb >= 16:
             cfg.lto = "thin"
         elif sp.ram_gb >= 8:
-            cfg.lto = "thin"     # still fine, just slower to link
+            cfg.lto = "thin"  # still fine, just slower to link
         else:
             cfg.lto = "no"
     else:
@@ -415,15 +500,25 @@ def smart_defaults(cfg: BuildConfig, sp: SystemSpecs) -> BuildConfig:
 
 def describe_system(sp: SystemSpecs) -> str:
     gpu_bits = []
-    if sp.has_nvidia:    gpu_bits.append("NVIDIA")
-    if sp.has_amdgpu:    gpu_bits.append("AMD")
-    if sp.has_intel_gpu: gpu_bits.append("Intel iGPU")
+    if sp.has_nvidia:
+        gpu_bits.append("NVIDIA")
+    if sp.has_amdgpu:
+        gpu_bits.append("AMD")
+    if sp.has_intel_gpu:
+        gpu_bits.append("Intel iGPU")
     gpu_str = " + ".join(gpu_bits) or "none detected"
     disk_str = []
-    if sp.root_is_nvme: disk_str.append("NVMe")
-    elif sp.root_is_ssd: disk_str.append("SSD")
-    else:               disk_str.append("HDD/unknown")
-    boot = "systemd-boot" if sp.uses_systemd_boot else ("GRUB" if sp.uses_grub else "unknown")
+    if sp.root_is_nvme:
+        disk_str.append("NVMe")
+    elif sp.root_is_ssd:
+        disk_str.append("SSD")
+    else:
+        disk_str.append("HDD/unknown")
+    boot = (
+        "systemd-boot"
+        if sp.uses_systemd_boot
+        else ("GRUB" if sp.uses_grub else "unknown")
+    )
     return (
         f"CPU: {sp.cpu_model or sp.cpu_vendor} "
         f"({sp.cpu_cores}c/{sp.cpu_threads}t, ISA: {sp.isa_level})\n"
@@ -438,6 +533,7 @@ def describe_system(sp: SystemSpecs) -> str:
 # =============================================================================
 # Root-privilege helper (cached password + sudo -S)
 # =============================================================================
+
 
 class Privileged:
     """Run commands as root. Shows a Qt password dialog once and caches."""
@@ -464,14 +560,16 @@ class Privileged:
                 p = subprocess.run(
                     ["sudo", "-S", "-p", "", "-v"],
                     input=(pw + "\n").encode(),
-                    capture_output=True, timeout=15,
+                    capture_output=True,
+                    timeout=15,
                 )
                 if p.returncode == 0:
                     self._password = pw
                     self._verified = True
                     return True
-                QMessageBox.warning(parent, APP_NAME,
-                                    "Incorrect password. Please try again.")
+                QMessageBox.warning(
+                    parent, APP_NAME, "Incorrect password. Please try again."
+                )
             except FileNotFoundError:
                 QMessageBox.critical(parent, APP_NAME, "'sudo' is not installed.")
                 return False
@@ -481,10 +579,10 @@ class Privileged:
     def wrap(self, argv: list[str]) -> tuple[list[str], Optional[bytes]]:
         if os.geteuid() == 0:
             return argv, None
-        assert self._verified and self._password is not None, \
+        assert self._verified and self._password is not None, (
             "Privileged.ensure() must be called before wrap()"
-        return (["sudo", "-S", "-p", ""] + argv,
-                (self._password + "\n").encode())
+        )
+        return (["sudo", "-S", "-p", ""] + argv, (self._password + "\n").encode())
 
 
 class PasswordDialog(QDialog):
@@ -497,7 +595,7 @@ class PasswordDialog(QDialog):
         lbl = QLabel(
             f"<b>{APP_NAME}</b> needs administrator privileges to install "
             f"build dependencies and/or the new kernel.<br><br>"
-            f"Enter the password for <b>{os.getenv('USER','user')}</b>:"
+            f"Enter the password for <b>{os.getenv('USER', 'user')}</b>:"
         )
         lbl.setWordWrap(True)
         v.addWidget(lbl)
@@ -505,8 +603,9 @@ class PasswordDialog(QDialog):
         self.pw.setEchoMode(QLineEdit.EchoMode.Password)
         self.pw.setPlaceholderText("sudo password")
         v.addWidget(self.pw)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
-                              QDialogButtonBox.StandardButton.Cancel)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
@@ -521,6 +620,7 @@ class PasswordDialog(QDialog):
 # Worker thread: runs the whole build off the UI thread
 # =============================================================================
 
+
 class BuildSignals(QObject):
     log = pyqtSignal(str)
     status = pyqtSignal(str)
@@ -529,8 +629,9 @@ class BuildSignals(QObject):
 
 
 class BuildWorker(QThread):
-    def __init__(self, cfg: BuildConfig, sp: SystemSpecs,
-                 priv: Privileged, actions: list[str]) -> None:
+    def __init__(
+        self, cfg: BuildConfig, sp: SystemSpecs, priv: Privileged, actions: list[str]
+    ) -> None:
         super().__init__()
         self.cfg = cfg
         self.sp = sp
@@ -548,7 +649,7 @@ class BuildWorker(QThread):
         self.bore_in_tree: bool = False
         self._log_fh: Optional[object] = None
         self.log_file_path: Optional[Path] = None
-        self._tail_lines: list[str] = []   # ring buffer for failure diagnosis
+        self._tail_lines: list[str] = []  # ring buffer for failure diagnosis
         self._tail_max = 200
 
     # --- logging ------------------------------------------------------------
@@ -560,13 +661,11 @@ class BuildWorker(QThread):
             if self.cfg.log_file_path:
                 p = Path(self.cfg.log_file_path)
             else:
-                from datetime import datetime
                 self.cfg.outdir.mkdir(parents=True, exist_ok=True)
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                 p = self.cfg.outdir / f"build-{ts}.log"
             p.parent.mkdir(parents=True, exist_ok=True)
-            self._log_fh = open(p, "w", buffering=1, encoding="utf-8",
-                                errors="replace")
+            self._log_fh = open(p, "w", buffering=1, encoding="utf-8", errors="replace")
             self.log_file_path = p
             header = (
                 f"# {APP_NAME}\n"
@@ -609,7 +708,7 @@ class BuildWorker(QThread):
         if msg:
             self._tail_lines.append(msg)
             if len(self._tail_lines) > self._tail_max:
-                del self._tail_lines[:len(self._tail_lines) - self._tail_max]
+                del self._tail_lines[: len(self._tail_lines) - self._tail_max]
 
     def status(self, msg: str) -> None:
         self.sig.status.emit(msg)
@@ -632,10 +731,18 @@ class BuildWorker(QThread):
         self._run(["make", *self._kconfig_env(), "olddefconfig"], cwd=src)
 
     # --- subprocess wrappers ------------------------------------------------
-    def _run(self, argv: list[str], *, cwd: Optional[Path] = None,
-             env: Optional[dict] = None, as_root: bool = False,
-             stdin_bytes: Optional[bytes] = None,
-             check: bool = True) -> int:
+    def _run(
+        self,
+        argv: list[str],
+        *,
+        cwd: Optional[Path] = None,
+        env: Optional[dict] = None,
+        as_root: bool = False,
+        stdin_bytes: Optional[bytes] = None,
+        check: bool = True,
+        close_fds: bool = True,
+        bufsize: int = -1,
+    ) -> int:
         if self._cancel:
             raise RuntimeError("cancelled")
 
@@ -654,13 +761,18 @@ class BuildWorker(QThread):
                 argv,
                 cwd=str(cwd) if cwd else None,
                 env=run_env,
-                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                stdin=subprocess.PIPE
+                if stdin_bytes is not None
+                else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                bufsize=0,
+                bufsize=bufsize,
+                close_fds=close_fds,
             )
         except FileNotFoundError as e:
             raise RuntimeError(f"command not found: {argv[0]} ({e})")
+        except OSError as e:
+            raise RuntimeError(f"failed to start {argv[0]}: {e}")
 
         if stdin_bytes is not None and self._active_proc.stdin:
             try:
@@ -670,9 +782,19 @@ class BuildWorker(QThread):
                 pass
 
         assert self._active_proc.stdout is not None
-        for raw in iter(self._active_proc.stdout.readline, b""):
+        proc = self._active_proc
+        for raw in iter(proc.stdout.readline, b""):
             if self._cancel:
-                self._active_proc.terminate()
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                # Closing our end of the pipe lets a blocked writer get
+                # SIGPIPE/EPIPE instead of waiting on a full buffer.
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
                 break
             try:
                 line = raw.decode(errors="replace")
@@ -682,14 +804,27 @@ class BuildWorker(QThread):
             if line.lstrip().startswith(tuple("0123456789")) and "K ." in line:
                 continue
             self.log(line)
-        rc = self._active_proc.wait()
+
+        # Make sure the process is gone; escalate to kill if terminate stalls.
+        # Keep _active_proc alive until we're done so cancel() can still kill.
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                proc.wait()
+        rc = proc.returncode
         self._active_proc = None
         if check and rc != 0:
             raise RuntimeError(f"{argv[0]} exited with status {rc}")
         return rc
 
-    def _http_get(self, url: str, dest: Optional[Path] = None,
-                  *, stream: bool = False) -> tuple[bool, bytes]:
+    def _http_get(
+        self, url: str, dest: Optional[Path] = None, *, stream: bool = False
+    ) -> tuple[bool, bytes]:
         self.log(f"  fetching {url}\n")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "cyfare/2.0"})
@@ -729,14 +864,16 @@ class BuildWorker(QThread):
                             if total:
                                 pct = 100.0 * got / total
                                 self.status(
-                                    f"Downloading… {got/1e6:.1f}/{total/1e6:.1f} MB ({pct:.0f}%)"
+                                    f"Downloading… {got / 1e6:.1f}/{total / 1e6:.1f} MB ({pct:.0f}%)"
                                 )
-                                self.log(f"  … {got/1e6:.1f} / {total/1e6:.1f} MB\n")
+                                self.log(
+                                    f"  … {got / 1e6:.1f} / {total / 1e6:.1f} MB\n"
+                                )
                             else:
-                                self.status(f"Downloading… {got/1e6:.1f} MB")
-                                self.log(f"  … {got/1e6:.1f} MB\n")
+                                self.status(f"Downloading… {got / 1e6:.1f} MB")
+                                self.log(f"  … {got / 1e6:.1f} MB\n")
                             last_report = got
-                    self.log(f"  done: {got/1e6:.1f} MB\n")
+                    self.log(f"  done: {got / 1e6:.1f} MB\n")
                     return True, (bytes(buf) if buf is not None else b"")
                 finally:
                     if fh is not None:
@@ -785,6 +922,7 @@ class BuildWorker(QThread):
             self._emit_failure(str(e))
         except Exception as e:
             import traceback
+
             self.log("\n" + traceback.format_exc())
             self._emit_failure(f"{type(e).__name__}: {e}")
         finally:
@@ -798,14 +936,19 @@ class BuildWorker(QThread):
         # Heuristic hints for common failures
         tail_text = "".join(self._tail_lines).lower()
         hints: list[str] = []
-        if "error 2" in tail_text and ("lto" in tail_text or
-                                        self.active_lto in ("thin", "full")):
+        if "error 2" in tail_text and (
+            "lto" in tail_text or self.active_lto in ("thin", "full")
+        ):
             hints.append(
                 "LTO link stage is the usual suspect when a vmlinux link "
                 "fails with a bare 'Error 2'. Try LTO = Disabled, or reduce "
                 "-j (memory pressure during ThinLTO linking)."
             )
-        if "oom" in tail_text or "killed" in tail_text or "cannot allocate memory" in tail_text:
+        if (
+            "oom" in tail_text
+            or "killed" in tail_text
+            or "cannot allocate memory" in tail_text
+        ):
             hints.append(
                 "Out-of-memory signal detected. Reduce -j jobs or disable LTO."
             )
@@ -829,8 +972,9 @@ class BuildWorker(QThread):
             )
         if not hints:
             hints.append(
-                "Re-run with 'Verbose build output' checked; the real compiler "
-                "message is usually hidden by parallel make."
+                "Re-run with 'Verbose build output' checked; on failure CKO "
+                "already retries with -j1 V=1, but enabling verbose output "
+                "shows every command from the start."
             )
         for h in hints:
             self.log(f"  hint: {h}\n")
@@ -849,27 +993,55 @@ class BuildWorker(QThread):
         clang_pkgs = ["clang", "lld", "llvm"] if want_clang else []
 
         self._run(["apt-get", "update"], as_root=True, check=False)
-        self._run([
-            "apt-get", "install", "-y", "--no-install-recommends",
-            # core toolchain
-            "build-essential", "bc", "bison", "flex",
-            # kernel-build libs / tools
-            "libelf-dev", "libssl-dev", "libncurses-dev",
-            "libdw-dev", "libdwarf-dev", "dwarves",
-            "zstd", "xz-utils", "lz4", "cpio", "kmod", "rsync", "perl",
-            # source fetching / patching
-            "git", "wget", "patch", "ca-certificates",
-            # packaging
-            "fakeroot", "debhelper", "dh-python", "python3",
-            "kernel-wedge",
-            # ccache
-            "ccache",
-        ] + clang_pkgs, as_root=True)
+        self._run(
+            [
+                "apt-get",
+                "install",
+                "-y",
+                "--no-install-recommends",
+                # core toolchain
+                "build-essential",
+                "bc",
+                "bison",
+                "flex",
+                # kernel-build libs / tools
+                "libelf-dev",
+                "libssl-dev",
+                "libncurses-dev",
+                "libdw-dev",
+                "libdwarf-dev",
+                "dwarves",
+                "zstd",
+                "xz-utils",
+                "lz4",
+                "cpio",
+                "kmod",
+                "rsync",
+                "perl",
+                # source fetching / patching
+                "git",
+                "wget",
+                "patch",
+                "ca-certificates",
+                # packaging
+                "fakeroot",
+                "debhelper",
+                "dh-python",
+                "python3",
+                "kernel-wedge",
+                # ccache
+                "ccache",
+            ]
+            + clang_pkgs,
+            as_root=True,
+        )
 
     # ---- toolchain decision -----------------------------------------------
     def _pick_toolchain(self) -> None:
         c = self.cfg.compiler
-        if c == "clang" or (c == "auto" and shutil.which("clang") and shutil.which("ld.lld")):
+        if c == "clang" or (
+            c == "auto" and shutil.which("clang") and shutil.which("ld.lld")
+        ):
             self.toolchain = "clang"
         else:
             self.toolchain = "gcc"
@@ -907,10 +1079,14 @@ class BuildWorker(QThread):
             parts = self.kernel_full_version.split(".")
             self.effective_series = ".".join(parts[:2])
             return
-        self.log(f"[cyfare] resolving latest stable {self.cfg.kernel_series}.x from kernel.org…\n")
+        self.log(
+            f"[cyfare] resolving latest stable {self.cfg.kernel_series}.x from kernel.org…\n"
+        )
         v = self._resolve_version_for_series(self.cfg.kernel_series)
         if not v:
-            raise RuntimeError(f"no {self.cfg.kernel_series}.x release found at kernel.org")
+            raise RuntimeError(
+                f"no {self.cfg.kernel_series}.x release found at kernel.org"
+            )
         self.kernel_full_version = v
         self.effective_series = self.cfg.kernel_series
         self.log(f"[cyfare] selected kernel {self.kernel_full_version}\n")
@@ -939,8 +1115,7 @@ class BuildWorker(QThread):
     def _cachyos_patch_urls(self, series: str) -> list[tuple[str, str]]:
         urls: list[tuple[str, str]] = []
         # 1. Combined base patch — one file that carries most of the goodies
-        urls.append(("all",
-                     f"{CACHYOS_RAW}/{series}/all/0001-cachyos-base-all.patch"))
+        urls.append(("all", f"{CACHYOS_RAW}/{series}/all/0001-cachyos-base-all.patch"))
         # 2. Directory listings via GitHub API
         for subdir in ("all", "", "sched", "misc"):
             api_path = f"{CACHYOS_API}/{series}" + (f"/{subdir}" if subdir else "")
@@ -956,10 +1131,13 @@ class BuildWorker(QThread):
                 if dl:
                     urls.append((subdir or "root", dl))
         # dedupe
-        seen = set(); out = []
+        seen = set()
+        out = []
         for cat, u in urls:
-            if u in seen: continue
-            seen.add(u); out.append((cat, u))
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append((cat, u))
         return out
 
     def _bore_upstream_patch(self, series: str) -> Optional[str]:
@@ -985,9 +1163,9 @@ class BuildWorker(QThread):
             return None
         exact = [u for s, u in candidates if s == series]
         older = sorted(
-            [(s, u) for s, u in candidates
-             if self._version_key(s) <= wanted],
-            key=lambda t: self._version_key(t[0]), reverse=True,
+            [(s, u) for s, u in candidates if self._version_key(s) <= wanted],
+            key=lambda t: self._version_key(t[0]),
+            reverse=True,
         )
         picks = exact + [u for _, u in older]
         for url in picks:
@@ -1006,7 +1184,8 @@ class BuildWorker(QThread):
             fn = pdir / f"{cat}__{Path(url).name}"
             if fn.exists() and fn.stat().st_size > 0:
                 self.log(f"  cached: {fn.name}\n")
-                fetched.append(fn); continue
+                fetched.append(fn)
+                continue
             ok, _ = self._http_get(url, fn)
             if ok and fn.stat().st_size > 0:
                 fetched.append(fn)
@@ -1019,7 +1198,8 @@ class BuildWorker(QThread):
             if not (fn.exists() and fn.stat().st_size > 0):
                 ok, _ = self._http_get(bore_url, fn)
                 if not (ok and fn.stat().st_size > 0):
-                    fn.unlink(missing_ok=True); fn = None  # type: ignore
+                    fn.unlink(missing_ok=True)
+                    fn = None  # type: ignore
             if fn and fn.exists():
                 fetched.append(fn)
         else:
@@ -1033,8 +1213,11 @@ class BuildWorker(QThread):
         if self.cfg.auto_fallback_series and not self.cfg.kernel_version:
             try:
                 wk = self._version_key(wanted)
-                walk += [s for s in SUPPORTED_SERIES_ORDER
-                         if s != wanted and self._version_key(s) <= wk]
+                walk += [
+                    s
+                    for s in SUPPORTED_SERIES_ORDER
+                    if s != wanted and self._version_key(s) <= wk
+                ]
             except ValueError:
                 pass
 
@@ -1053,13 +1236,17 @@ class BuildWorker(QThread):
             chosen_series = wanted
 
         if chosen_series is None:
-            self.log(f"[warn] no patches found anywhere (tried {tried}); "
-                     f"building vanilla {wanted}\n")
+            self.log(
+                f"[warn] no patches found anywhere (tried {tried}); "
+                f"building vanilla {wanted}\n"
+            )
             chosen_series = wanted
 
         if chosen_series != self.effective_series:
-            self.log(f"[cyfare] switching from {self.effective_series} -> "
-                     f"{chosen_series} to align with available patches\n")
+            self.log(
+                f"[cyfare] switching from {self.effective_series} -> "
+                f"{chosen_series} to align with available patches\n"
+            )
             v = self._resolve_version_for_series(chosen_series)
             if not v:
                 raise RuntimeError(f"cannot resolve latest {chosen_series}.x")
@@ -1075,14 +1262,22 @@ class BuildWorker(QThread):
         def order_key(p: Path) -> tuple:
             n = p.name.lower()
             score = 50
-            if "cachyos-base-all" in n: score = 0
-            elif "cachy" in n and "bore" not in n: score = 10
-            elif "fixes" in n: score = 20
-            elif "bbr" in n: score = 25
-            elif "amd" in n or "hdmi" in n or "t2" in n: score = 30
-            elif "vmscape" in n or "vesa" in n: score = 35
-            elif "sched-ext" in n: score = 40
-            elif "bore" in n: score = 90
+            if "cachyos-base-all" in n:
+                score = 0
+            elif "cachy" in n and "bore" not in n:
+                score = 10
+            elif "fixes" in n:
+                score = 20
+            elif "bbr" in n:
+                score = 25
+            elif "amd" in n or "hdmi" in n or "t2" in n:
+                score = 30
+            elif "vmscape" in n or "vesa" in n:
+                score = 35
+            elif "sched-ext" in n:
+                score = 40
+            elif "bore" in n:
+                score = 90
             return (score, n)
 
         patches_sorted = sorted(patches, key=order_key)
@@ -1090,28 +1285,54 @@ class BuildWorker(QThread):
             self.status(f"Applying {p.name}…")
             self.log(f"[cyfare] applying {p.name}\n")
             dry = subprocess.run(
-                ["patch", "-p1", "--dry-run", "--forward",
-                 "-l", "--fuzz=3", "--no-backup-if-mismatch", "-i", str(p)],
-                cwd=str(src), capture_output=True, text=True,
+                [
+                    "patch",
+                    "-p1",
+                    "--dry-run",
+                    "--forward",
+                    "-l",
+                    "--fuzz=3",
+                    "--no-backup-if-mismatch",
+                    "-i",
+                    str(p),
+                ],
+                cwd=str(src),
+                capture_output=True,
+                text=True,
             )
             if dry.returncode != 0:
-                self.log(dry.stdout); self.log(dry.stderr or "")
+                self.log(dry.stdout)
+                self.log(dry.stderr or "")
                 self.log(f"[warn] {p.name} does not apply (fuzz=3); skipping\n")
                 self.failed_patches.append(p.name)
                 continue
             try:
-                self._run(["patch", "-p1", "--forward",
-                           "-l", "--fuzz=3", "--no-backup-if-mismatch",
-                           "-i", str(p)], cwd=src)
+                self._run(
+                    [
+                        "patch",
+                        "-p1",
+                        "--forward",
+                        "-l",
+                        "--fuzz=3",
+                        "--no-backup-if-mismatch",
+                        "-i",
+                        str(p),
+                    ],
+                    cwd=src,
+                )
                 self.applied_patches.append(p.name)
             except RuntimeError as e:
                 self.log(f"[warn] {p.name} failed during apply: {e}\n")
                 self.failed_patches.append(p.name)
 
-        self.log(f"\n[cyfare] applied {len(self.applied_patches)} patch(es), "
-                 f"failed {len(self.failed_patches)}\n")
-        for n in self.applied_patches: self.log(f"  + {n}\n")
-        for n in self.failed_patches:  self.log(f"  - {n}\n")
+        self.log(
+            f"\n[cyfare] applied {len(self.applied_patches)} patch(es), "
+            f"failed {len(self.failed_patches)}\n"
+        )
+        for n in self.applied_patches:
+            self.log(f"  + {n}\n")
+        for n in self.failed_patches:
+            self.log(f"  - {n}\n")
 
     # ---- configure --------------------------------------------------------
     def _has_f2fs_mount(self) -> bool:
@@ -1152,8 +1373,11 @@ class BuildWorker(QThread):
                 raise RuntimeError("no running-kernel config available")
         elif mode == "localmod":
             self._run(["make", *self._kconfig_env(), "defconfig"], cwd=src)
-            self._run(["make", *self._kconfig_env(), "localmodconfig"],
-                      cwd=src, stdin_bytes=b"")
+            self._run(
+                ["make", *self._kconfig_env(), "localmodconfig"],
+                cwd=src,
+                stdin_bytes=b"",
+            )
         elif mode == "defconfig":
             self._run(["make", *self._kconfig_env(), "defconfig"], cwd=src)
         elif mode == "file":
@@ -1171,24 +1395,40 @@ class BuildWorker(QThread):
         sc = "./scripts/config"
 
         def scfg(*args: str) -> None:
-            subprocess.run([sc, *args], cwd=str(src),
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                [sc, *args],
+                cwd=str(src),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
         # identity
         scfg("--set-str", "LOCALVERSION", self.cfg.local_version)
         scfg("--disable", "LOCALVERSION_AUTO")
 
         # BORE + sched_ext
-        scfg("--enable", "SCHED_BORE")
+        if self.cfg.sched_bore:
+            scfg("--enable", "SCHED_BORE")
         scfg("--enable", "SCHED_CLASS_EXT")
 
         # preemption
-        for k in ("PREEMPT_NONE", "PREEMPT_VOLUNTARY", "PREEMPT", "PREEMPT_RT",
-                  "PREEMPT_DYNAMIC"):
+        for k in (
+            "PREEMPT_NONE",
+            "PREEMPT_VOLUNTARY",
+            "PREEMPT",
+            "PREEMPT_RT",
+            "PREEMPT_DYNAMIC",
+        ):
             scfg("--disable", k)
-        scfg("--enable",
-             {"none": "PREEMPT_NONE", "voluntary": "PREEMPT_VOLUNTARY",
-              "full": "PREEMPT", "rt": "PREEMPT_RT"}[self.cfg.preempt])
+        scfg(
+            "--enable",
+            {
+                "none": "PREEMPT_NONE",
+                "voluntary": "PREEMPT_VOLUNTARY",
+                "full": "PREEMPT",
+                "rt": "PREEMPT_RT",
+            }[self.cfg.preempt],
+        )
 
         # HZ
         for h in ("100", "250", "300", "500", "600", "750", "1000"):
@@ -1199,18 +1439,30 @@ class BuildWorker(QThread):
         # tick
         for k in ("HZ_PERIODIC", "NO_HZ_IDLE", "NO_HZ_FULL", "NO_HZ"):
             scfg("--disable", k)
-        scfg("--enable",
-             {"periodic": "HZ_PERIODIC", "idle": "NO_HZ_IDLE",
-              "full": "NO_HZ_FULL"}[self.cfg.tick])
+        scfg(
+            "--enable",
+            {"periodic": "HZ_PERIODIC", "idle": "NO_HZ_IDLE", "full": "NO_HZ_FULL"}[
+                self.cfg.tick
+            ],
+        )
         if self.cfg.tick in ("idle", "full"):
             scfg("--enable", "NO_HZ")
             scfg("--enable", "NO_HZ_COMMON")
 
         # march (x86-64 levels; only valid with CachyOS patches applied)
         if os.uname().machine == "x86_64":
-            for k in ("GENERIC_CPU", "GENERIC_CPU2", "GENERIC_CPU3",
-                      "GENERIC_CPU4", "MK8", "MPSC", "MATOM", "MCORE2",
-                      "MNATIVE_INTEL", "MNATIVE_AMD"):
+            for k in (
+                "GENERIC_CPU",
+                "GENERIC_CPU2",
+                "GENERIC_CPU3",
+                "GENERIC_CPU4",
+                "MK8",
+                "MPSC",
+                "MATOM",
+                "MCORE2",
+                "MNATIVE_INTEL",
+                "MNATIVE_AMD",
+            ):
                 scfg("--disable", k)
             m = self.cfg.march
             if m == "auto":
@@ -1262,8 +1514,10 @@ class BuildWorker(QThread):
         scfg("--set-str", "ZSWAP_COMPRESSOR_DEFAULT", "zstd")
         scfg("--enable", "ZSWAP_ZPOOL_DEFAULT_ZSMALLOC")
         scfg("--set-str", "ZSWAP_ZPOOL_DEFAULT", "zsmalloc")
-        scfg("--enable", "LRU_GEN"); scfg("--enable", "LRU_GEN_ENABLED")
-        scfg("--enable", "TCP_CONG_BBR"); scfg("--set-str", "DEFAULT_TCP_CONG", "bbr")
+        scfg("--enable", "LRU_GEN")
+        scfg("--enable", "LRU_GEN_ENABLED")
+        scfg("--enable", "TCP_CONG_BBR")
+        scfg("--set-str", "DEFAULT_TCP_CONG", "bbr")
         scfg("--enable", "TCP_CONG_CUBIC")
 
         # Storage tuning
@@ -1293,7 +1547,7 @@ class BuildWorker(QThread):
         scfg("--disable", "DEBUG_INFO_DWARF4")
         scfg("--disable", "DEBUG_INFO_DWARF5")
         scfg("--disable", "DEBUG_INFO_BTF")
-        scfg("--enable",  "DEBUG_INFO_NONE")
+        scfg("--enable", "DEBUG_INFO_NONE")
         scfg("--set-str", "SYSTEM_TRUSTED_KEYS", "")
         scfg("--set-str", "SYSTEM_REVOCATION_KEYS", "")
         scfg("--disable", "MODULE_SIG_ALL")
@@ -1308,12 +1562,16 @@ class BuildWorker(QThread):
         # dodge the incompatibility. F2FS is primarily for flash cards
         # and Android; desktop Debian users almost never use it.
         if self._has_f2fs_mount():
-            self.log("[cyfare] f2fs filesystem detected in /proc/mounts — "
-                     "keeping F2FS enabled (may fail to build if CachyOS "
-                     "f2fs patch clashes with BORE)\n")
+            self.log(
+                "[cyfare] f2fs filesystem detected in /proc/mounts — "
+                "keeping F2FS enabled (may fail to build if CachyOS "
+                "f2fs patch clashes with BORE)\n"
+            )
         else:
-            self.log("[cyfare] no f2fs mount detected — disabling F2FS_FS "
-                     "to avoid CachyOS f2fs patch / BORE sched_entity clash\n")
+            self.log(
+                "[cyfare] no f2fs mount detected — disabling F2FS_FS "
+                "to avoid CachyOS f2fs patch / BORE sched_entity clash\n"
+            )
             scfg("--disable", "F2FS_FS")
             scfg("--disable", "F2FS_STAT_FS")
             scfg("--disable", "F2FS_FS_XATTR")
@@ -1346,52 +1604,89 @@ class BuildWorker(QThread):
         # Verify BORE actually made it in
         try:
             conf = cfg_path.read_text(errors="replace")
-            self.bore_in_tree = ("\nCONFIG_SCHED_BORE=y" in conf) or conf.startswith("CONFIG_SCHED_BORE=y")
+            self.bore_in_tree = ("\nCONFIG_SCHED_BORE=y" in conf) or conf.startswith(
+                "CONFIG_SCHED_BORE=y"
+            )
         except OSError:
             self.bore_in_tree = False
 
-        if not self.bore_in_tree:
-            self.log("[warn] CONFIG_SCHED_BORE is NOT set in .config — BORE patch likely didn't apply; "
-                     "build will be vanilla EEVDF.\n")
-        else:
+        if self.cfg.sched_bore and not self.bore_in_tree:
+            self.log(
+                "[warn] CONFIG_SCHED_BORE is NOT set in .config — BORE patch likely didn't apply; "
+                "build will be vanilla EEVDF.\n"
+            )
+        elif self.cfg.sched_bore:
             self.log("[cyfare] verified CONFIG_SCHED_BORE=y in .config\n")
 
-    # ---- compile ----------------------------------------------------------
-    def _compile(self, src: Path) -> None:
-        self.status(f"Compiling kernel ({self.cfg.jobs} jobs, {self.toolchain})…")
+    def _make_base_cmd(self, extra_jobs: Optional[int] = None) -> list[str]:
+        """Return the common `make` prefix (-j, LLVM=1, V=1)."""
+        jobs = extra_jobs if extra_jobs is not None else self.cfg.jobs
+        cmd = ["make", f"-j{jobs}"]
+        if self.toolchain == "clang":
+            cmd += ["LLVM=1"]
+        if self.cfg.verbose:
+            cmd += ["V=1"]
+        return cmd
+
+    def _compile_env(self) -> dict[str, str]:
+        """Environment used for compile and packaging steps."""
         env = os.environ.copy()
         kcflags = "-pipe"
         if self.cfg.o_level == "3":
             kcflags += " -O3"
         env["KCFLAGS"] = kcflags
 
-        # --output-sync=line keeps each parallel recipe's output contiguous
-        # so a failing job's error message isn't interleaved with (and
-        # silently dropped by) 20 other jobs' output. This is the single
-        # most important flag for diagnosing parallel kbuild failures.
-        base = ["make", "--output-sync=line", f"-j{self.cfg.jobs}"]
-        if self.toolchain == "clang":
-            base += ["LLVM=1"]
-        if self.cfg.verbose:
-            base += ["V=1"]
-        argv = base + ["all"]
+        # Sanitize MAKEFLAGS so a user/CI setting cannot silently serialize
+        # the build or override our -j value. Command-line -j wins over -j in
+        # MAKEFLAGS, but --output-sync and other global options are merged.
+        makeflags = env.get("MAKEFLAGS", "")
+        makeflags = re.sub(r"(^|\s)--output-sync(=\S*)?", " ", makeflags)
+        makeflags = re.sub(r"(^|\s)-j\s*\d+", " ", makeflags)
+        makeflags = re.sub(r"(^|\s)-O\S*", " ", makeflags)
+        makeflags = " ".join(makeflags.split())
+        if makeflags:
+            env["MAKEFLAGS"] = makeflags
+        elif "MAKEFLAGS" in env:
+            del env["MAKEFLAGS"]
+
+        return env
+
+    # ---- compile ----------------------------------------------------------
+    def _compile(self, src: Path) -> None:
+        self.status(f"Compiling kernel ({self.cfg.jobs} jobs, {self.toolchain})…")
+        env = self._compile_env()
+
+        # NOTE: We deliberately do NOT use --output-sync here.  When make's
+        # stdout is redirected to a pipe (as it is via subprocess.PIPE),
+        # --output-sync=line can serialize recipe execution so that only one
+        # job runs at a time, which defeats -jN and is exactly what users see
+        # as "one core at 100 %".  If this parallel build fails we retry with
+        # -j1 V=1, which gives clean, non-interleaved diagnostics.
+        argv = self._make_base_cmd() + ["all"]
         try:
-            self._run(argv, cwd=src, env=env)
+            # close_fds=False keeps GNU make's jobserver FIFO accessible to
+            # sub-makes, and buffered stdout avoids serializing writers on a
+            # full pipe.
+            self._run(argv, cwd=src, env=env, close_fds=False, bufsize=-1)
         except RuntimeError as e:
             # Parallel build failed. Retry serially with V=1 to surface the
             # real compiler/linker error. This is slow but only runs on
             # failure, and the output ends up in the log file.
-            self.log("\n[cyfare] parallel build failed; "
-                     "retrying with -j1 V=1 to locate the real error…\n")
+            self.log(
+                "\n[cyfare] parallel build failed; "
+                "retrying with -j1 V=1 to locate the real error…\n"
+            )
             retry = ["make", "-j1", "V=1"]
             if self.toolchain == "clang":
                 retry += ["LLVM=1"]
             retry += ["all"]
-            self._run(retry, cwd=src, env=env)
+            self._run(retry, cwd=src, env=env, close_fds=False, bufsize=-1)
             # If the serial retry somehow succeeds (rare — flaky race),
             # we're done. Otherwise _run() raises and propagates.
-            self.log("[cyfare] serial retry succeeded; parallel failure "
-                     "was a race. Consider lowering -j.\n")
+            self.log(
+                "[cyfare] serial retry succeeded; parallel failure "
+                "was a race. Consider lowering -j.\n"
+            )
 
     # ---- package (Debian .deb only) ---------------------------------------
     def _package(self, src: Path) -> None:
@@ -1400,18 +1695,22 @@ class BuildWorker(QThread):
             return
         self.cfg.outdir.mkdir(parents=True, exist_ok=True)
         self.status("Packaging kernel as .deb…")
-        mk = ["make", "--output-sync=line", f"-j{self.cfg.jobs}"]
-        if self.toolchain == "clang":
-            mk += ["LLVM=1"]
-        if self.cfg.verbose:
-            mk += ["V=1"]
+        mk = self._make_base_cmd()
+        env = self._compile_env()
 
         try:
-            self._run(mk + [
-                "bindeb-pkg",
-                f"LOCALVERSION={self.cfg.local_version}",
-                f"KDEB_PKGVERSION={self.kernel_full_version}-cyfare-1",
-            ], cwd=src)
+            self._run(
+                mk
+                + [
+                    "bindeb-pkg",
+                    f"LOCALVERSION={self.cfg.local_version}",
+                    f"KDEB_PKGVERSION={self.kernel_full_version}-cyfare-1",
+                ],
+                cwd=src,
+                env=env,
+                close_fds=False,
+                bufsize=-1,
+            )
             # .deb files land in src.parent
             for f in src.parent.glob("linux-*.deb"):
                 shutil.move(str(f), str(self.cfg.outdir / f.name))
@@ -1421,8 +1720,13 @@ class BuildWorker(QThread):
                     shutil.move(str(f), str(self.cfg.outdir / f.name))
         except RuntimeError as e:
             self.log(f"[warn] bindeb-pkg failed ({e}); producing tarball instead\n")
-            self._run(mk + ["tarxz-pkg", f"LOCALVERSION={self.cfg.local_version}"],
-                      cwd=src)
+            self._run(
+                mk + ["tarxz-pkg", f"LOCALVERSION={self.cfg.local_version}"],
+                cwd=src,
+                env=env,
+                close_fds=False,
+                bufsize=-1,
+            )
             for f in src.glob("linux-*.tar.xz"):
                 shutil.move(str(f), str(self.cfg.outdir / f.name))
 
@@ -1450,15 +1754,23 @@ class BuildWorker(QThread):
         self._package(src)
 
         self.log("\n============= BUILD SUMMARY =============\n")
-        self.log(f"Kernel         : {self.kernel_full_version}{self.cfg.local_version}\n")
-        self.log(f"Series used    : {self.effective_series}"
-                 f"{' (auto-fallback)' if self.effective_series != self.cfg.kernel_series else ''}\n")
+        self.log(
+            f"Kernel         : {self.kernel_full_version}{self.cfg.local_version}\n"
+        )
+        self.log(
+            f"Series used    : {self.effective_series}"
+            f"{' (auto-fallback)' if self.effective_series != self.cfg.kernel_series else ''}\n"
+        )
         self.log(f"Toolchain      : {self.toolchain}  LTO: {self.active_lto}\n")
         self.log(f"march / -O     : {self.cfg.march} / -O{self.cfg.o_level}\n")
-        self.log(f"Patches        : {len(self.applied_patches)} applied, "
-                 f"{len(self.failed_patches)} failed\n")
-        self.log(f"BORE scheduler : "
-                 f"{'YES (CONFIG_SCHED_BORE=y)' if self.bore_in_tree else 'NO (vanilla EEVDF)'}\n")
+        self.log(
+            f"Patches        : {len(self.applied_patches)} applied, "
+            f"{len(self.failed_patches)} failed\n"
+        )
+        self.log(
+            f"BORE scheduler : "
+            f"{'YES (CONFIG_SCHED_BORE=y)' if self.bore_in_tree else 'NO (vanilla EEVDF)'}\n"
+        )
         self.log("=========================================\n")
 
     # ---- install (Debian .deb only) ---------------------------------------
@@ -1472,8 +1784,11 @@ class BuildWorker(QThread):
             raise RuntimeError("no .deb files found in outdir")
         # Prefer `apt install ./pkg.deb` — it resolves dependencies.
         deb_args = [str(d) for d in debs]
-        self._run(["apt-get", "install", "-y", "--no-install-recommends", *deb_args],
-                  as_root=True, check=False)
+        self._run(
+            ["apt-get", "install", "-y", "--no-install-recommends", *deb_args],
+            as_root=True,
+            check=False,
+        )
         # Fallback to dpkg -i if apt route failed
         self._run(["dpkg", "-i", *deb_args], as_root=True, check=False)
         self._run(["apt-get", "install", "-f", "-y"], as_root=True, check=False)
@@ -1484,13 +1799,15 @@ class BuildWorker(QThread):
         # Debian's linux-image .deb already regenerates initramfs and updates grub
         # via its postinst hooks, but invoke the tools explicitly as a safety net.
         if shutil.which("update-initramfs"):
-            self._run(["update-initramfs", "-u", "-k", kver],
-                      as_root=True, check=False)
+            self._run(["update-initramfs", "-u", "-k", kver], as_root=True, check=False)
         if shutil.which("update-grub"):
             self._run(["update-grub"], as_root=True, check=False)
         elif shutil.which("grub-mkconfig"):
-            self._run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"],
-                      as_root=True, check=False)
+            self._run(
+                ["grub-mkconfig", "-o", "/boot/grub/grub.cfg"],
+                as_root=True,
+                check=False,
+            )
         if self.sp.uses_systemd_boot and shutil.which("bootctl"):
             self._run(["bootctl", "update"], as_root=True, check=False)
 
@@ -1592,7 +1909,7 @@ class KernelBuilder(QMainWindow):
         self.worker: Optional[BuildWorker] = None
         self.sp = detect_system()
         self._build_ui()
-        self._apply_smart_defaults()   # aggressive defaults on first launch
+        self._apply_smart_defaults()  # aggressive defaults on first launch
 
     # -- layout -------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -1607,10 +1924,15 @@ class KernelBuilder(QMainWindow):
         title.setObjectName("h1")
         subtitle = QLabel("V2.0 · Debian-only · BORE + CachyOS · Smart defaults")
         subtitle.setObjectName("hint")
-        hcol = QVBoxLayout(); hcol.addWidget(title); hcol.addWidget(subtitle)
-        header.addLayout(hcol); header.addStretch()
-        env_lbl = QLabel(f"distro: <b>{self.sp.distro_id or '?'}</b>  ·  "
-                         f"apt: <b>{'ok' if shutil.which('apt-get') else 'missing'}</b>")
+        hcol = QVBoxLayout()
+        hcol.addWidget(title)
+        hcol.addWidget(subtitle)
+        header.addLayout(hcol)
+        header.addStretch()
+        env_lbl = QLabel(
+            f"distro: <b>{self.sp.distro_id or '?'}</b>  ·  "
+            f"apt: <b>{'ok' if shutil.which('apt-get') else 'missing'}</b>"
+        )
         env_lbl.setObjectName("hint")
         header.addWidget(env_lbl)
         root.addLayout(header)
@@ -1629,10 +1951,10 @@ class KernelBuilder(QMainWindow):
         root.addWidget(specs_group)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._tab_source(),   "  Source  ")
-        self.tabs.addTab(self._tab_cpu(),      "  CPU & Arch  ")
-        self.tabs.addTab(self._tab_sched(),    "  Scheduler & Timing  ")
-        self.tabs.addTab(self._tab_tool(),     "  Toolchain  ")
+        self.tabs.addTab(self._tab_source(), "  Source  ")
+        self.tabs.addTab(self._tab_cpu(), "  CPU & Arch  ")
+        self.tabs.addTab(self._tab_sched(), "  Scheduler & Timing  ")
+        self.tabs.addTab(self._tab_tool(), "  Toolchain  ")
         self.tabs.addTab(self._tab_advanced(), "  Advanced  ")
         root.addWidget(self.tabs, 1)
 
@@ -1650,22 +1972,33 @@ class KernelBuilder(QMainWindow):
         self.btn_clean = QPushButton("Clean")
         self.btn_clean.clicked.connect(lambda: self._start(["clean"]))
         self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setObjectName("danger"); self.btn_stop.setEnabled(False)
+        self.btn_stop.setObjectName("danger")
+        self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
-        for b in (self.btn_preview, self.btn_build, self.btn_bi,
-                  self.btn_install, self.btn_clean):
+        for b in (
+            self.btn_preview,
+            self.btn_build,
+            self.btn_bi,
+            self.btn_install,
+            self.btn_clean,
+        ):
             actions.addWidget(b)
-        actions.addStretch(); actions.addWidget(self.btn_stop)
+        actions.addStretch()
+        actions.addWidget(self.btn_stop)
         root.addLayout(actions)
 
-        log_lbl = QLabel("Build log"); log_lbl.setObjectName("hint")
+        log_lbl = QLabel("Build log")
+        log_lbl.setObjectName("hint")
         root.addWidget(log_lbl)
-        self.log = QPlainTextEdit(); self.log.setObjectName("log")
-        self.log.setReadOnly(True); self.log.setMinimumHeight(240)
+        self.log = QPlainTextEdit()
+        self.log.setObjectName("log")
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(240)
         root.addWidget(self.log, 1)
 
         self.progress = QProgressBar()
-        self.progress.setFixedWidth(240); self.progress.setRange(0, 0)
+        self.progress.setFixedWidth(240)
+        self.progress.setRange(0, 0)
         self.progress.setVisible(False)
         sb = QStatusBar()
         self.status_lbl = QLabel("Ready")
@@ -1676,17 +2009,20 @@ class KernelBuilder(QMainWindow):
 
         if not self.sp.is_debian_family:
             QMessageBox.critical(
-                self, APP_NAME,
+                self,
+                APP_NAME,
                 "This tool is Debian/Ubuntu only. "
                 "apt-get + dpkg are required.\n\n"
                 "If you believe this is wrong (e.g. derivative distro), ensure "
-                "/etc/os-release sets ID_LIKE to include 'debian' or 'ubuntu'."
+                "/etc/os-release sets ID_LIKE to include 'debian' or 'ubuntu'.",
             )
 
     # -- tabs ---------------------------------------------------------------
     def _tab_source(self) -> QWidget:
-        w = QWidget(); v = QVBoxLayout(w)
-        g = QGroupBox("Kernel"); f = QFormLayout(g)
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Kernel")
+        f = QFormLayout(g)
         self.kernel_series = QLineEdit("7.0")
         self.kernel_version = QLineEdit()
         self.kernel_version.setPlaceholderText("(empty = auto-detect latest .x)")
@@ -1695,7 +2031,8 @@ class KernelBuilder(QMainWindow):
         f.addRow("Exact version:", self.kernel_version)
         f.addRow("Local version suffix:", self.local_version)
 
-        g2 = QGroupBox("Patches"); gv = QVBoxLayout(g2)
+        g2 = QGroupBox("Patches")
+        gv = QVBoxLayout(g2)
         self.patches_on = QCheckBox("Apply CachyOS patchset + upstream BORE fallback")
         self.patches_on.setChecked(True)
         self.auto_fallback = QCheckBox(
@@ -1711,30 +2048,39 @@ class KernelBuilder(QMainWindow):
             "<code>firelzrd/bore-scheduler</code>. Patches are applied with "
             "fuzz=3 tolerance and listed in the build log."
         )
-        hint.setWordWrap(True); hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        hint.setObjectName("hint")
         gv.addWidget(self.patches_on)
         gv.addWidget(self.auto_fallback)
         gv.addWidget(hint)
 
-        g3 = QGroupBox("Directories"); gf = QFormLayout(g3)
+        g3 = QGroupBox("Directories")
+        gf = QFormLayout(g3)
         self.workdir = QLineEdit(str(Path.home() / "cyfare-build"))
         self.outdir = QLineEdit(str(Path.home() / "cyfare-out"))
         gf.addRow("Build directory:", self.workdir)
         gf.addRow("Output directory:", self.outdir)
 
-        v.addWidget(g); v.addWidget(g2); v.addWidget(g3); v.addStretch(1)
+        v.addWidget(g)
+        v.addWidget(g2)
+        v.addWidget(g3)
+        v.addStretch(1)
         return w
 
     def _tab_cpu(self) -> QWidget:
-        w = QWidget(); v = QVBoxLayout(w)
-        g = QGroupBox("Target CPU micro-architecture"); gv = QVBoxLayout(g)
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Target CPU micro-architecture")
+        gv = QVBoxLayout(g)
         self.march = QComboBox()
-        self.march.addItem(f"Auto — detected: {self.sp.isa_level}",                 "auto")
-        self.march.addItem("generic — any x86-64 CPU (portable, shareable)",        "generic")
-        self.march.addItem("x86-64-v2 — Nehalem+ (2008+)",                          "x86-64-v2")
-        self.march.addItem("x86-64-v3 — Haswell/Excavator+ (AVX2, 2013+)",          "x86-64-v3")
-        self.march.addItem("x86-64-v4 — AVX-512 CPUs",                              "x86-64-v4")
-        self.march.addItem("native — THIS machine only (fastest, unshareable)",     "native")
+        self.march.addItem(f"Auto — detected: {self.sp.isa_level}", "auto")
+        self.march.addItem("generic — any x86-64 CPU (portable, shareable)", "generic")
+        self.march.addItem("x86-64-v2 — Nehalem+ (2008+)", "x86-64-v2")
+        self.march.addItem("x86-64-v3 — Haswell/Excavator+ (AVX2, 2013+)", "x86-64-v3")
+        self.march.addItem("x86-64-v4 — AVX-512 CPUs", "x86-64-v4")
+        self.march.addItem(
+            "native — THIS machine only (fastest, unshareable)", "native"
+        )
         gv.addWidget(self.march)
         note = QLabel(
             "<b>Auto</b> picks the highest x86-64-vN level your CPU's flags support, "
@@ -1743,130 +2089,203 @@ class KernelBuilder(QMainWindow):
             "<b>native</b> targets ONLY the CPU in this box — fastest, but won't boot on "
             "other CPUs."
         )
-        note.setWordWrap(True); note.setObjectName("hint")
+        note.setWordWrap(True)
+        note.setObjectName("hint")
         gv.addWidget(note)
 
-        g2 = QGroupBox("Compiler optimisation level"); gh = QHBoxLayout(g2)
-        self.o_level = QComboBox(); self.o_level.addItems(["2", "3"])
-        gh.addWidget(QLabel("Kernel -O level:")); gh.addWidget(self.o_level); gh.addStretch(1)
-        hint = QLabel("<b>-O2</b> upstream default · <b>-O3</b> more aggressive (requires CachyOS patchset).")
+        g2 = QGroupBox("Compiler optimisation level")
+        gh = QHBoxLayout(g2)
+        self.o_level = QComboBox()
+        self.o_level.addItems(["2", "3"])
+        gh.addWidget(QLabel("Kernel -O level:"))
+        gh.addWidget(self.o_level)
+        gh.addStretch(1)
+        hint = QLabel(
+            "<b>-O2</b> upstream default · <b>-O3</b> more aggressive (requires CachyOS patchset)."
+        )
         hint.setObjectName("hint")
-        v.addWidget(g); v.addWidget(g2); v.addWidget(hint); v.addStretch(1)
+        v.addWidget(g)
+        v.addWidget(g2)
+        v.addWidget(hint)
+        v.addStretch(1)
         return w
 
     def _tab_sched(self) -> QWidget:
-        w = QWidget(); v = QVBoxLayout(w)
-        g = QGroupBox("Scheduler"); gf = QFormLayout(g)
-        self.sched_bore = QCheckBox("BORE (Burst-Oriented Response Enhancer) — recommended")
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Scheduler")
+        gf = QFormLayout(g)
+        self.sched_bore = QCheckBox(
+            "BORE (Burst-Oriented Response Enhancer) — recommended"
+        )
         self.sched_bore.setChecked(True)
         gf.addRow(self.sched_bore)
-        hint = QLabel("BORE greatly improves desktop/gaming responsiveness. Requires a BORE patch.")
-        hint.setObjectName("hint"); gf.addRow(hint)
+        hint = QLabel(
+            "BORE greatly improves desktop/gaming responsiveness. Requires a BORE patch."
+        )
+        hint.setObjectName("hint")
+        gf.addRow(hint)
 
-        g2 = QGroupBox("Preemption"); g2v = QVBoxLayout(g2)
+        g2 = QGroupBox("Preemption")
+        g2v = QVBoxLayout(g2)
         self.preempt = QComboBox()
-        for label, val in [("Full preemption — lowest latency (desktop/gaming)", "full"),
-                           ("Voluntary — balanced (default distro)", "voluntary"),
-                           ("None — throughput (server)", "none"),
-                           ("Real-time (RT)", "rt")]:
+        for label, val in [
+            ("Full preemption — lowest latency (desktop/gaming)", "full"),
+            ("Voluntary — balanced (default distro)", "voluntary"),
+            ("None — throughput (server)", "none"),
+            ("Real-time (RT)", "rt"),
+        ]:
             self.preempt.addItem(label, val)
         g2v.addWidget(self.preempt)
 
-        g3 = QGroupBox("Timer frequency (HZ)"); g3v = QVBoxLayout(g3)
+        g3 = QGroupBox("Timer frequency (HZ)")
+        g3v = QVBoxLayout(g3)
         self.hz = QComboBox()
         for v_hz in ("1000", "750", "500", "300", "250"):
-            self.hz.addItem(v_hz + (" (desktop default)" if v_hz == "1000" else ""), v_hz)
+            self.hz.addItem(
+                v_hz + (" (desktop default)" if v_hz == "1000" else ""), v_hz
+            )
         g3v.addWidget(self.hz)
 
-        g4 = QGroupBox("Tick mode"); g4v = QVBoxLayout(g4)
+        g4 = QGroupBox("Tick mode")
+        g4v = QVBoxLayout(g4)
         self.tick = QComboBox()
         self.tick.addItem("Idle tickless (NO_HZ_IDLE) — recommended", "idle")
-        self.tick.addItem("Full tickless (NO_HZ_FULL) — HPC/RT",       "full")
-        self.tick.addItem("Periodic",                                    "periodic")
+        self.tick.addItem("Full tickless (NO_HZ_FULL) — HPC/RT", "full")
+        self.tick.addItem("Periodic", "periodic")
         g4v.addWidget(self.tick)
 
-        v.addWidget(g); v.addWidget(g2); v.addWidget(g3); v.addWidget(g4); v.addStretch(1)
+        v.addWidget(g)
+        v.addWidget(g2)
+        v.addWidget(g3)
+        v.addWidget(g4)
+        v.addStretch(1)
         return w
 
     def _tab_tool(self) -> QWidget:
-        w = QWidget(); v = QVBoxLayout(w)
-        g = QGroupBox("Compiler"); f = QFormLayout(g)
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Compiler")
+        f = QFormLayout(g)
         self.compiler = QComboBox()
-        clang_hint = " (detected)" if self.sp.has_clang and self.sp.has_lld else " (not installed yet — will be fetched)"
-        self.compiler.addItem(f"Auto-detect (prefer Clang if present){clang_hint}", "auto")
-        self.compiler.addItem("GCC",          "gcc")
+        clang_hint = (
+            " (detected)"
+            if self.sp.has_clang and self.sp.has_lld
+            else " (not installed yet — will be fetched)"
+        )
+        self.compiler.addItem(
+            f"Auto-detect (prefer Clang if present){clang_hint}", "auto"
+        )
+        self.compiler.addItem("GCC", "gcc")
         self.compiler.addItem("Clang + LLVM", "clang")
         f.addRow("Toolchain:", self.compiler)
         self.lto = QComboBox()
         self.lto.addItem("Auto (ThinLTO if Clang + enough RAM)", "auto")
         self.lto.addItem("ThinLTO — fast link, near-Full quality", "thin")
-        self.lto.addItem("Full LTO — best perf, heavy RAM+time",   "full")
-        self.lto.addItem("Disabled",                                "no")
+        self.lto.addItem("Full LTO — best perf, heavy RAM+time", "full")
+        self.lto.addItem("Disabled", "no")
         f.addRow("Link-time optimisation:", self.lto)
         hint = QLabel(
             "LTO requires Clang+LLD. <b>ThinLTO</b> is the recommended choice "
             "for desktops — ~5–10% perf uplift at modest link-time cost. "
             "<b>Full LTO</b> wants 32 GB+ RAM."
         )
-        hint.setObjectName("hint"); hint.setWordWrap(True)
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
         f.addRow(hint)
 
-        g2 = QGroupBox("Parallelism"); f2 = QFormLayout(g2)
-        self.jobs = QSpinBox(); self.jobs.setRange(1, 256); self.jobs.setValue(self.sp.cpu_threads)
+        g2 = QGroupBox("Parallelism")
+        f2 = QFormLayout(g2)
+        self.jobs = QSpinBox()
+        self.jobs.setRange(1, 256)
+        self.jobs.setValue(self.sp.cpu_threads)
         f2.addRow("Parallel make jobs (-j):", self.jobs)
         ram_hint = QLabel(
             f"Detected {self.sp.cpu_threads} logical CPUs, {self.sp.ram_gb} GB RAM. "
             "Smart defaults bounds -j by RAM so LTO linking doesn't OOM."
         )
-        ram_hint.setObjectName("hint"); ram_hint.setWordWrap(True)
+        ram_hint.setObjectName("hint")
+        ram_hint.setWordWrap(True)
         f2.addRow(ram_hint)
 
-        g3 = QGroupBox("GPU-specific tweaks"); g3v = QVBoxLayout(g3)
-        self.chk_nvidia = QCheckBox("Disable Nouveau (for NVIDIA proprietary driver users)")
-        self.chk_amd    = QCheckBox("Enable amdgpu for legacy SI/CIK GPUs")
+        g3 = QGroupBox("GPU-specific tweaks")
+        g3v = QVBoxLayout(g3)
+        self.chk_nvidia = QCheckBox(
+            "Disable Nouveau (for NVIDIA proprietary driver users)"
+        )
+        self.chk_amd = QCheckBox("Enable amdgpu for legacy SI/CIK GPUs")
         self.chk_nvidia.setChecked(self.sp.has_nvidia)
         self.chk_amd.setChecked(self.sp.has_amdgpu)
-        g3v.addWidget(self.chk_nvidia); g3v.addWidget(self.chk_amd)
+        g3v.addWidget(self.chk_nvidia)
+        g3v.addWidget(self.chk_amd)
 
-        v.addWidget(g); v.addWidget(g2); v.addWidget(g3); v.addStretch(1)
+        v.addWidget(g)
+        v.addWidget(g2)
+        v.addWidget(g3)
+        v.addStretch(1)
         return w
 
     def _tab_advanced(self) -> QWidget:
-        w = QWidget(); v = QVBoxLayout(w)
-        g = QGroupBox("Starting .config"); gv = QVBoxLayout(g)
+        w = QWidget()
+        v = QVBoxLayout(w)
+        g = QGroupBox("Starting .config")
+        gv = QVBoxLayout(g)
         self.config_mode = QComboBox()
         self.config_mode.addItem("Auto (running kernel → distro → defconfig)", "auto")
-        self.config_mode.addItem("Running kernel config",   "running")
-        self.config_mode.addItem("localmodconfig (only currently-loaded modules)", "localmod")
+        self.config_mode.addItem("Running kernel config", "running")
+        self.config_mode.addItem(
+            "localmodconfig (only currently-loaded modules)", "localmod"
+        )
         self.config_mode.addItem("defconfig (upstream defaults)", "defconfig")
         self.config_mode.addItem("Load from file…", "file")
         gv.addWidget(self.config_mode)
 
         row = QHBoxLayout()
         self.config_file = QLineEdit()
-        self.config_file.setPlaceholderText("Path to .config (only when 'Load from file')")
-        pick = QToolButton(); pick.setText("…"); pick.clicked.connect(self._browse_config)
-        row.addWidget(self.config_file, 1); row.addWidget(pick)
-        holder = QWidget(); holder.setLayout(row); gv.addWidget(holder)
+        self.config_file.setPlaceholderText(
+            "Path to .config (only when 'Load from file')"
+        )
+        pick = QToolButton()
+        pick.setText("…")
+        pick.clicked.connect(self._browse_config)
+        row.addWidget(self.config_file, 1)
+        row.addWidget(pick)
+        holder = QWidget()
+        holder.setLayout(row)
+        gv.addWidget(holder)
         self.config_mode.currentIndexChanged.connect(
-            lambda _i: self.config_file.setEnabled(self.config_mode.currentData() == "file")
+            lambda _i: self.config_file.setEnabled(
+                self.config_mode.currentData() == "file"
+            )
         )
         self.config_file.setEnabled(False)
 
-        g2 = QGroupBox("Extra config fragment"); h2 = QHBoxLayout(g2)
+        g2 = QGroupBox("Extra config fragment")
+        h2 = QHBoxLayout(g2)
         self.extra_cfg = QLineEdit()
-        self.extra_cfg.setPlaceholderText("Optional: file with extra CONFIG_* lines to merge")
-        pick2 = QToolButton(); pick2.setText("…"); pick2.clicked.connect(self._browse_extra)
-        h2.addWidget(self.extra_cfg, 1); h2.addWidget(pick2)
+        self.extra_cfg.setPlaceholderText(
+            "Optional: file with extra CONFIG_* lines to merge"
+        )
+        pick2 = QToolButton()
+        pick2.setText("…")
+        pick2.clicked.connect(self._browse_extra)
+        h2.addWidget(self.extra_cfg, 1)
+        h2.addWidget(pick2)
 
-        g3 = QGroupBox("Behaviour"); g3v = QVBoxLayout(g3)
-        self.verbose = QCheckBox("Verbose build output (make V=1 — shows every compiler command)")
-        self.download_only = QCheckBox("Download only (fetch sources/patches, don't build)")
+        g3 = QGroupBox("Behaviour")
+        g3v = QVBoxLayout(g3)
+        self.verbose = QCheckBox(
+            "Verbose build output (make V=1 — shows every compiler command)"
+        )
+        self.download_only = QCheckBox(
+            "Download only (fetch sources/patches, don't build)"
+        )
         self.build_only = QCheckBox("Build only (don't package)")
         for c in (self.verbose, self.download_only, self.build_only):
             g3v.addWidget(c)
 
-        g4 = QGroupBox("Build log file"); g4v = QVBoxLayout(g4)
+        g4 = QGroupBox("Build log file")
+        g4v = QVBoxLayout(g4)
         self.log_to_file = QCheckBox(
             "Write full build output to a log file (strongly recommended)"
         )
@@ -1877,22 +2296,30 @@ class KernelBuilder(QMainWindow):
         self.log_file_path.setPlaceholderText(
             "Auto: <outdir>/build-YYYYMMDD-HHMMSS.log"
         )
-        pick3 = QToolButton(); pick3.setText("…"); pick3.clicked.connect(self._browse_log)
-        row4.addWidget(self.log_file_path, 1); row4.addWidget(pick3)
-        holder4 = QWidget(); holder4.setLayout(row4); g4v.addWidget(holder4)
+        pick3 = QToolButton()
+        pick3.setText("…")
+        pick3.clicked.connect(self._browse_log)
+        row4.addWidget(self.log_file_path, 1)
+        row4.addWidget(pick3)
+        holder4 = QWidget()
+        holder4.setLayout(row4)
+        g4v.addWidget(holder4)
         log_hint = QLabel(
             "Every line shown in the Build log pane is mirrored verbatim to "
             "this file. If a build fails (e.g. generic 'Error 2' at link "
             "time), open this file to find the real compiler/linker message."
         )
-        log_hint.setWordWrap(True); log_hint.setObjectName("hint")
+        log_hint.setWordWrap(True)
+        log_hint.setObjectName("hint")
         g4v.addWidget(log_hint)
         # Enable/disable the path field based on checkbox
-        self.log_to_file.toggled.connect(
-            lambda on: self.log_file_path.setEnabled(on)
-        )
+        self.log_to_file.toggled.connect(lambda on: self.log_file_path.setEnabled(on))
 
-        v.addWidget(g); v.addWidget(g2); v.addWidget(g3); v.addWidget(g4); v.addStretch(1)
+        v.addWidget(g)
+        v.addWidget(g2)
+        v.addWidget(g3)
+        v.addWidget(g4)
+        v.addStretch(1)
         return w
 
     # -- helpers ------------------------------------------------------------
@@ -1904,10 +2331,11 @@ class KernelBuilder(QMainWindow):
 
         # Source
         self.kernel_series.setText(cfg.kernel_series)
-        self.kernel_version.setText("")   # always auto-latest
+        self.kernel_version.setText("")  # always auto-latest
         self.local_version.setText(cfg.local_version)
         self.patches_on.setChecked(cfg.patches)
         self.auto_fallback.setChecked(cfg.auto_fallback_series)
+        self.sched_bore.setChecked(cfg.sched_bore)
 
         # CPU/Arch
         idx = self.march.findData(cfg.march)
@@ -1938,46 +2366,59 @@ class KernelBuilder(QMainWindow):
             self.status_lbl.setText("Smart defaults applied")
 
     def _browse_config(self) -> None:
-        p, _ = QFileDialog.getOpenFileName(self, "Select kernel .config", "", "All files (*)")
-        if p: self.config_file.setText(p)
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select kernel .config", "", "All files (*)"
+        )
+        if p:
+            self.config_file.setText(p)
 
     def _browse_extra(self) -> None:
-        p, _ = QFileDialog.getOpenFileName(self, "Select extra config fragment", "", "All files (*)")
-        if p: self.extra_cfg.setText(p)
+        p, _ = QFileDialog.getOpenFileName(
+            self, "Select extra config fragment", "", "All files (*)"
+        )
+        if p:
+            self.extra_cfg.setText(p)
 
     def _browse_log(self) -> None:
-        p, _ = QFileDialog.getSaveFileName(self, "Choose build log file path",
-                                           str(Path.home() / "cyfare-build.log"),
-                                           "Log files (*.log);;All files (*)")
-        if p: self.log_file_path.setText(p)
+        p, _ = QFileDialog.getSaveFileName(
+            self,
+            "Choose build log file path",
+            str(Path.home() / "cyfare-build.log"),
+            "Log files (*.log);;All files (*)",
+        )
+        if p:
+            self.log_file_path.setText(p)
 
     def _collect_config(self) -> BuildConfig:
         return BuildConfig(
-            kernel_series = self.kernel_series.text().strip() or "7.0",
-            kernel_version = self.kernel_version.text().strip(),
-            local_version = self.local_version.text().strip() or "-cyfare",
-            march = self.march.currentData(),
-            o_level = self.o_level.currentText(),
-            preempt = self.preempt.currentData(),
-            hz = self.hz.currentData(),
-            tick = self.tick.currentData(),
-            compiler = self.compiler.currentData(),
-            lto = self.lto.currentData(),
-            jobs = self.jobs.value(),
-            config_mode = self.config_mode.currentData(),
-            config_file = self.config_file.text().strip(),
-            extra_config = self.extra_cfg.text().strip(),
-            patches = self.patches_on.isChecked(),
-            auto_fallback_series = self.auto_fallback.isChecked(),
-            verbose = self.verbose.isChecked(),
-            download_only = self.download_only.isChecked(),
-            build_only = self.build_only.isChecked(),
-            workdir = Path(self.workdir.text().strip() or str(Path.home() / "cyfare-build")),
-            outdir = Path(self.outdir.text().strip() or str(Path.home() / "cyfare-out")),
-            nvidia_tweaks = self.chk_nvidia.isChecked(),
-            amdgpu_tweaks = self.chk_amd.isChecked(),
-            log_to_file = self.log_to_file.isChecked(),
-            log_file_path = self.log_file_path.text().strip(),
+            kernel_series=self.kernel_series.text().strip() or "7.0",
+            kernel_version=self.kernel_version.text().strip(),
+            local_version=self.local_version.text().strip() or "-cyfare",
+            march=self.march.currentData(),
+            o_level=self.o_level.currentText(),
+            preempt=self.preempt.currentData(),
+            hz=self.hz.currentData(),
+            tick=self.tick.currentData(),
+            compiler=self.compiler.currentData(),
+            lto=self.lto.currentData(),
+            jobs=self.jobs.value(),
+            config_mode=self.config_mode.currentData(),
+            config_file=self.config_file.text().strip(),
+            extra_config=self.extra_cfg.text().strip(),
+            patches=self.patches_on.isChecked(),
+            auto_fallback_series=self.auto_fallback.isChecked(),
+            sched_bore=self.sched_bore.isChecked(),
+            verbose=self.verbose.isChecked(),
+            download_only=self.download_only.isChecked(),
+            build_only=self.build_only.isChecked(),
+            workdir=Path(
+                self.workdir.text().strip() or str(Path.home() / "cyfare-build")
+            ),
+            outdir=Path(self.outdir.text().strip() or str(Path.home() / "cyfare-out")),
+            nvidia_tweaks=self.chk_nvidia.isChecked(),
+            amdgpu_tweaks=self.chk_amd.isChecked(),
+            log_to_file=self.log_to_file.isChecked(),
+            log_file_path=self.log_file_path.text().strip(),
         )
 
     def _preview(self) -> None:
@@ -1987,7 +2428,7 @@ class KernelBuilder(QMainWindow):
             f"Exact version      : {cfg.kernel_version or '(auto)'}",
             f"Local suffix       : {cfg.local_version}",
             f"march / -O         : {cfg.march} / -O{cfg.o_level}",
-            f"Scheduler          : BORE (via patchset: {cfg.patches})",
+            f"Scheduler          : BORE={cfg.sched_bore} (patchset: {cfg.patches})",
             f"Auto series fallb. : {cfg.auto_fallback_series}",
             f"Preempt / HZ / Tick: {cfg.preempt} / {cfg.hz} / {cfg.tick}",
             f"Compiler / LTO     : {cfg.compiler} / {cfg.lto}",
@@ -2010,8 +2451,9 @@ class KernelBuilder(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "A build is already running.")
             return
         if not self.sp.is_debian_family:
-            QMessageBox.critical(self, APP_NAME,
-                                 "Non-Debian system detected; refusing to run.")
+            QMessageBox.critical(
+                self, APP_NAME, "Non-Debian system detected; refusing to run."
+            )
             return
         cfg = self._collect_config()
         if os.geteuid() != 0:
@@ -2039,8 +2481,13 @@ class KernelBuilder(QMainWindow):
             self.worker = None
 
     def _set_running(self, running: bool) -> None:
-        for b in (self.btn_build, self.btn_bi, self.btn_install,
-                  self.btn_clean, self.btn_preview):
+        for b in (
+            self.btn_build,
+            self.btn_bi,
+            self.btn_install,
+            self.btn_clean,
+            self.btn_preview,
+        ):
             b.setEnabled(not running)
         self.btn_stop.setEnabled(running)
         self.progress.setVisible(running)
@@ -2054,11 +2501,14 @@ class KernelBuilder(QMainWindow):
     def closeEvent(self, e) -> None:
         if self.worker is not None:
             r = QMessageBox.question(
-                self, APP_NAME,
+                self,
+                APP_NAME,
                 "A build is still running. Stop it and quit?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
             if r != QMessageBox.StandardButton.Yes:
-                e.ignore(); return
+                e.ignore()
+                return
             self._stop()
             if self.worker:
                 self.worker.wait(3000)
@@ -2068,23 +2518,25 @@ class KernelBuilder(QMainWindow):
 
 # =============================================================================
 
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setApplicationName(APP_NAME)
     pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window,          QColor("#16181d"))
-    pal.setColor(QPalette.ColorRole.WindowText,      QColor("#e6e8ee"))
-    pal.setColor(QPalette.ColorRole.Base,            QColor("#12141a"))
-    pal.setColor(QPalette.ColorRole.AlternateBase,   QColor("#1b1e25"))
-    pal.setColor(QPalette.ColorRole.Text,            QColor("#e6e8ee"))
-    pal.setColor(QPalette.ColorRole.Button,          QColor("#252a35"))
-    pal.setColor(QPalette.ColorRole.ButtonText,      QColor("#e6e8ee"))
-    pal.setColor(QPalette.ColorRole.Highlight,       QColor("#3b82f6"))
+    pal.setColor(QPalette.ColorRole.Window, QColor("#16181d"))
+    pal.setColor(QPalette.ColorRole.WindowText, QColor("#e6e8ee"))
+    pal.setColor(QPalette.ColorRole.Base, QColor("#12141a"))
+    pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#1b1e25"))
+    pal.setColor(QPalette.ColorRole.Text, QColor("#e6e8ee"))
+    pal.setColor(QPalette.ColorRole.Button, QColor("#252a35"))
+    pal.setColor(QPalette.ColorRole.ButtonText, QColor("#e6e8ee"))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#3b82f6"))
     pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     app.setPalette(pal)
     app.setStyleSheet(DARK_QSS)
-    win = KernelBuilder(); win.show()
+    win = KernelBuilder()
+    win.show()
     return app.exec()
 
 
